@@ -12,6 +12,8 @@ const DB_FILE = './users.json';
 const POSTS_FILE = './posts.json';
 const GROUPS_FILE = './groups.json';
 const ACCOUNTS_FILE = './accounts.json';
+const BOTS_FILE = './bots.json';
+const NEWS_FILE = './news.json';
 
 let users = {};
 if (fs.existsSync(DB_FILE)) { try { users = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (e) { users = {}; } }
@@ -30,6 +32,14 @@ function saveGroups() { fs.writeFileSync(GROUPS_FILE, JSON.stringify(groups)); }
 let accounts = {};
 if (fs.existsSync(ACCOUNTS_FILE)) { try { accounts = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')); } catch (e) { accounts = {}; } }
 function saveAccounts() { fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(accounts)); }
+
+let bots = {};
+if (fs.existsSync(BOTS_FILE)) { try { bots = JSON.parse(fs.readFileSync(BOTS_FILE, 'utf8')); } catch (e) { bots = {}; } }
+function saveBots() { fs.writeFileSync(BOTS_FILE, JSON.stringify(bots)); }
+
+let news = [];
+if (fs.existsSync(NEWS_FILE)) { try { news = JSON.parse(fs.readFileSync(NEWS_FILE, 'utf8')); } catch (e) { news = []; } }
+function saveNews() { fs.writeFileSync(NEWS_FILE, JSON.stringify(news)); }
 
 // Одноразовые коды (2FA / сброс пароля) — в памяти, живут 10 минут.
 // Если сервер перезапустится (Render иногда так делает после "сна") — коды
@@ -61,9 +71,7 @@ async function verifyTurnstile(token, ip) {
   } catch (e) { return false; }
 }
 
-// Отправка почты через твой личный Gmail-аккаунт (пароль приложения, не основной пароль).
-// Транспорт создаём один раз и переиспользуем — так быстрее, чем открывать
-// новое SMTP-соединение на каждое письмо.
+// Отправка почты через личный Gmail-аккаунт (пароль приложения, не основной пароль)
 let mailTransporter = null;
 function getMailTransporter() {
   if (mailTransporter) return mailTransporter;
@@ -72,10 +80,7 @@ function getMailTransporter() {
   }
   mailTransporter = nodemailer.createTransport({
     service: 'gmail',
-    auth: {
-      user: process.env.GMAIL_USER,
-      pass: process.env.GMAIL_APP_PASSWORD
-    }
+    auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD }
   });
   return mailTransporter;
 }
@@ -92,7 +97,7 @@ async function sendEmailCode(toEmail, code) {
 // ===== АУТЕНТИФИКАЦИЯ =====
 
 // Регистрация — принимает уже хешированный пароль (клиент хеширует SHA-256,
-// как и раньше — сырой пароль на сервер не уходит вообще)
+// сырой пароль на сервер не уходит вообще)
 app.post('/auth/register', async (req, res) => {
   const { login, passwordHash, turnstileToken } = req.body;
   const ok = await verifyTurnstile(turnstileToken, req.ip);
@@ -199,7 +204,6 @@ app.get('/users/by-account/:accountId', (req, res) => {
   if (!u) return res.status(404).json({ error: 'not found' });
   res.json(u);
 });
-
 // ===== ПОСТЫ =====
 app.post('/posts', (req, res) => {
   const { id, authorId, authorNick, authorAvatar, text, image, timestamp } = req.body;
@@ -234,11 +238,11 @@ app.delete('/posts/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-// ===== ГРУППЫ =====
+// ===== ГРУППЫ (с описанием и режимом "только создатель пишет") =====
 app.post('/groups', (req, res) => {
-  const { id, name, avatar, createdBy, members } = req.body;
+  const { id, name, description, announceOnly, avatar, createdBy, members } = req.body;
   if (!id || !name || !createdBy || !Array.isArray(members)) return res.status(400).json({ error: 'bad payload' });
-  groups[id] = { id, name, avatar: avatar || null, createdBy, members, updatedAt: Date.now() };
+  groups[id] = { id, name, description: description || '', announceOnly: !!announceOnly, avatar: avatar || null, createdBy, members, updatedAt: Date.now() };
   saveGroups();
   res.json({ ok: true, group: groups[id] });
 });
@@ -257,14 +261,65 @@ app.get('/groups/:id', (req, res) => {
 app.put('/groups/:id', (req, res) => {
   const g = groups[req.params.id];
   if (!g) return res.status(404).json({ error: 'not found' });
-  const { name, avatar, members, requesterId } = req.body;
+  const { name, description, announceOnly, avatar, members, requesterId } = req.body;
   if (requesterId !== g.createdBy) return res.status(403).json({ error: 'only creator can edit' });
   if (name) g.name = name;
+  if (description !== undefined) g.description = description;
+  if (announceOnly !== undefined) g.announceOnly = announceOnly;
   if (avatar !== undefined) g.avatar = avatar;
   if (Array.isArray(members)) g.members = members;
   g.updatedAt = Date.now();
   saveGroups();
   res.json({ ok: true, group: g });
+});
+
+// ===== БОТЫ (простые автоответчики по ключевым словам) =====
+app.post('/bots', (req, res) => {
+  const { id, name, avatar, createdBy, rules, defaultReply } = req.body;
+  if (!id || !name || !createdBy) return res.status(400).json({ error: 'bad payload' });
+  if (bots[id] && bots[id].createdBy !== createdBy) return res.status(403).json({ error: 'not owner' });
+  bots[id] = { id, name, avatar: avatar || null, createdBy, rules: Array.isArray(rules) ? rules : [], defaultReply: defaultReply || 'Не понимаю, что вы имеете в виду.' };
+  saveBots();
+  res.json({ ok: true, bot: bots[id] });
+});
+
+app.get('/bots/search', (req, res) => {
+  const term = (req.query.name || '').toLowerCase();
+  if (!term) return res.json([]);
+  const results = Object.values(bots).filter(b => b.name.toLowerCase().includes(term));
+  res.json(results.map(b => ({ id: b.id, name: b.name, avatar: b.avatar, isBot: true })));
+});
+
+app.get('/bots/:id', (req, res) => {
+  const b = bots[req.params.id];
+  if (!b) return res.status(404).json({ error: 'not found' });
+  res.json(b);
+});
+
+app.delete('/bots/:id', (req, res) => {
+  const b = bots[req.params.id];
+  if (!b) return res.json({ ok: true });
+  if (b.createdBy !== req.query.requesterId) return res.status(403).json({ error: 'not owner' });
+  delete bots[req.params.id];
+  saveBots();
+  res.json({ ok: true });
+});
+
+// ===== НОВОСТИ (единый канал, публиковать может только тот, кто знает секретный ключ) =====
+app.post('/news', (req, res) => {
+  const { text, image, adminSecret } = req.body;
+  if (!process.env.NEWS_ADMIN_SECRET || adminSecret !== process.env.NEWS_ADMIN_SECRET) {
+    return res.status(403).json({ error: 'Неверный секретный ключ' });
+  }
+  if (!text && !image) return res.status(400).json({ error: 'Пустая новость' });
+  news.unshift({ id: Date.now() + Math.random().toString(36), text: text || '', image: image || null, timestamp: Date.now() });
+  if (news.length > 200) news = news.slice(0, 200);
+  saveNews();
+  res.json({ ok: true });
+});
+
+app.get('/news', (req, res) => {
+  res.json(news);
 });
 
 const PORT = process.env.PORT || 3001;
